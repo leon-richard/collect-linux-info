@@ -21,6 +21,7 @@
 #include <iconv.h>
 #include <algorithm>
 #include <memory>
+#include <linux/hdreg.h>
 
 // Convert UTF-8 to GBK using iconv for high-fidelity terminal compatibility
 std::string Utf8ToGbk(const std::string& utf8_str) {
@@ -228,38 +229,59 @@ int main() {
     
     // Disk Serial
     Log("开始获取硬盘序列号");
-    int fd_ide = open("/dev/hda", O_RDONLY | O_NONBLOCK);
-    if (fd_ide < 0) {
-        std::string errmsg = strerror(errno);
-        Log("IDE Disk打开失败，fd：" + std::to_string(fd_ide) + "，errno：" + std::to_string(errno) + "，errmsg：" + errmsg);
-    } else {
-        close(fd_ide);
-    }
-    
-    int fd_scsi = open("/dev/sda", O_RDONLY | O_NONBLOCK);
-    if (fd_scsi < 0) {
-        std::string errmsg = strerror(errno);
-        Log("SCSI device打开失败，fd：" + std::to_string(fd_scsi) + "，errno：" + std::to_string(errno) + "，errmsg：" + errmsg);
-    } else {
-        close(fd_scsi);
-    }
-    
-    int disk_exit = 0;
-    std::string disk_cmd = "lshw -class disk|grep serial";
-    std::string disk_output = ExecCommand(disk_cmd, disk_exit);
     std::string disk_serial = "";
-    if (disk_exit != 0) {
-        Log("调用失败：Errno：" + std::to_string(disk_exit) + "，未匹配到内容或权限不足等一般性错误: " + disk_cmd);
-        Log("尝试lshw获取硬盘序列号失败");
+    std::vector<std::string> open_errors;
+    
+    int fd = open("/dev/hda", O_RDONLY | O_NONBLOCK);
+    if (fd < 0) {
+        open_errors.push_back("IDE Disk打开失败，fd：" + std::to_string(fd) + "，errno：" + std::to_string(errno) + "，errmsg：" + strerror(errno));
+        fd = open("/dev/sda", O_RDONLY | O_NONBLOCK);
+        if (fd < 0) {
+            open_errors.push_back("SCSI device打开失败，fd：" + std::to_string(fd) + "，errno：" + std::to_string(errno) + "，errmsg：" + strerror(errno));
+        }
+    }
+    
+    if (fd < 0) {
+        // Both opened failed, print open failure logs
+        for (const auto& err : open_errors) {
+            Log(err);
+        }
     } else {
-        size_t pos = disk_output.find("serial:");
-        if (pos != std::string::npos) {
-            disk_serial = disk_output.substr(pos + 7);
+        // One opened successfully, try ioctl
+        struct hd_driveid id;
+        int ret = ioctl(fd, HDIO_GET_IDENTITY, &id);
+        if (ret < 0) {
+            Log("ioctl调用失败，ret：" + std::to_string(ret) + "，errno：" + std::to_string(errno) + "，errmsg：" + strerror(errno));
+        } else {
+            char serial_buf[40];
+            std::memset(serial_buf, 0, sizeof(serial_buf));
+            std::memcpy(serial_buf, id.serial_no, sizeof(id.serial_no));
+            disk_serial = serial_buf;
+            // Trim leading/trailing spaces
             disk_serial.erase(0, disk_serial.find_first_not_of(" \t\r\n"));
             disk_serial.erase(disk_serial.find_last_not_of(" \t\r\n") + 1);
         }
-        if (disk_serial.empty()) {
+        close(fd);
+    }
+    
+    // If we couldn't get it via ioctl (or opens failed), fall back to lshw
+    if (disk_serial.empty()) {
+        int disk_exit = 0;
+        std::string disk_cmd = "lshw -class disk|grep serial";
+        std::string disk_output = ExecCommand(disk_cmd, disk_exit);
+        if (disk_exit != 0) {
+            Log("调用失败：Errno：" + std::to_string(disk_exit) + "，未匹配到内容或权限不足等一般性错误: " + disk_cmd);
             Log("尝试lshw获取硬盘序列号失败");
+        } else {
+            size_t pos = disk_output.find("serial:");
+            if (pos != std::string::npos) {
+                disk_serial = disk_output.substr(pos + 7);
+                disk_serial.erase(0, disk_serial.find_first_not_of(" \t\r\n"));
+                disk_serial.erase(disk_serial.find_last_not_of(" \t\r\n") + 1);
+            }
+            if (disk_serial.empty()) {
+                Log("尝试lshw获取硬盘序列号失败");
+            }
         }
     }
     Log("获取硬盘序列号完成");
@@ -275,9 +297,20 @@ int main() {
     } else {
         size_t pos = cpu_output.find("ID:");
         if (pos != std::string::npos) {
-            cpu_serial = cpu_output.substr(pos + 3);
-            cpu_serial.erase(0, cpu_serial.find_first_not_of(" \t\r\n"));
-            cpu_serial.erase(cpu_serial.find_last_not_of(" \t\r\n") + 1);
+            // Find the end of that first line containing "ID:"
+            size_t end_line = cpu_output.find('\n', pos);
+            std::string first_id_line = cpu_output.substr(pos + 3, (end_line == std::string::npos) ? std::string::npos : (end_line - (pos + 3)));
+            
+            // Clean spaces and all non-alphanumeric characters
+            std::string clean_id = "";
+            for (char c : first_id_line) {
+                if (std::isalnum(c)) {
+                    clean_id += c;
+                }
+            }
+            cpu_serial = clean_id;
+            // Convert to uppercase to match the original GBK program output perfectly
+            std::transform(cpu_serial.begin(), cpu_serial.end(), cpu_serial.begin(), ::toupper);
         }
     }
     Log("获取CPU序列号完成");
